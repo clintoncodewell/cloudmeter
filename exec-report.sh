@@ -7,6 +7,9 @@ set -e
 #  Output: styled HTML report opened in browser
 # =====================================================================
 
+# Force OAuth auth — unset API key so Claude uses interactive login credentials
+unset ANTHROPIC_API_KEY
+
 CONFIG="$HOME/.config/cloudmeter/config.json"
 if [ ! -f "$CONFIG" ]; then echo "No config found at $CONFIG"; exit 1; fi
 
@@ -171,7 +174,8 @@ Priority table: P1/P2/P3 with Action, Impact, Effort, Timeline columns.
 PROMPTEOF
 
 # Run Claude Code headless with the prompt file
-claude -p "$(cat "$PROMPT_FILE")" --output-format text > "$REPORT" 2>/dev/null
+# claude -p sends response to stderr when piped, so capture both streams
+cat "$PROMPT_FILE" | claude -p --output-format text > "$REPORT" 2>&1
 
 # Clean up
 rm -f "$PROMPT_FILE"
