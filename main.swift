@@ -1837,8 +1837,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-            proc.arguments = [script]
-            proc.environment = ProcessInfo.processInfo.environment
+            proc.arguments = ["-l", script]  // login shell to pick up PATH
+            // Strip API key so claude uses OAuth; ensure PATH includes ~/.local/bin
+            var env = ProcessInfo.processInfo.environment
+            env.removeValue(forKey: "ANTHROPIC_API_KEY")
+            let home = NSHomeDirectory()
+            let extraPaths = "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin"
+            env["PATH"] = extraPaths + ":" + (env["PATH"] ?? "/usr/bin:/bin")
+            proc.environment = env
             let pipe = Pipe()
             proc.standardOutput = pipe
             proc.standardError = pipe
