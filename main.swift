@@ -28,8 +28,8 @@ let SVC_COLORS: [NSColor] = [.systemBlue, .systemOrange, .systemPurple, .systemT
 let OTHER_CLR: NSColor = NSColor.systemGray.withAlphaComponent(0.5)
 
 // Settings options — single source of truth
-let REFRESH_LABELS = ["15m", "30m", "1h", "2h"]
-let REFRESH_VALUES = [15, 30, 60, 120]
+let REFRESH_LABELS = ["2x Daily", "Hourly", "Manual"]
+let REFRESH_VALUES = [0, 60, -1]  // 0 = smart 2x/day, 60 = hourly, -1 = manual only
 let DISPLAY_LABELS = ["Yesterday", "MTD", "Burn Rate"]
 let DISPLAY_VALUES = ["yesterday", "mtd", "burn"]
 let ALERT_LABELS   = ["70%", "80%", "90%", "100%"]
@@ -76,7 +76,7 @@ struct Cfg: Codable {
         projectId: "your-gcp-project-id",
         datasetId: "gcp_billing_export",
         tableId: "gcp_billing_export_v1_XXXXXX_XXXXXX_XXXXXX",
-        refreshMin: 30, displayMode: "yesterday", monthlyBudget: 0,
+        refreshMin: 0, displayMode: "yesterday", monthlyBudget: 0,
         alertPct: 80, enableAlerts: false, enableDaily: false
     )
 
@@ -202,6 +202,8 @@ class DataMgr {
     var budget: Double = 0
     var allProjects: [String] = []       // distinct project IDs
     var selectedProject: String? = nil   // nil = all projects
+    // Per-project cost summaries: [projectId: (yesterday: Double, rolling7d: Double)]
+    var projectCosts: [String: (yesterday: Double, rolling7d: Double)] = [:]
 
     // Cached after each refresh — avoids recomputing per-row
     private var _topServices: [(name: String, total: Double)] = []
@@ -373,12 +375,14 @@ class DataMgr {
                   \(projFilter)
                 GROUP BY month ORDER BY month
                 """
-            // Fetch distinct projects (only when we don't have them yet)
+            // Per-project daily totals (for dropdown labels)
             let q3 = """
-                SELECT DISTINCT project.id FROM \(tbl)
-                WHERE DATE(usage_start_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
+                SELECT project.id, DATE(usage_start_time) AS date,
+                  ROUND(SUM(cost) + SUM(IFNULL((SELECT SUM(c.amount) FROM UNNEST(credits) c),0)),2) AS subtotal
+                FROM \(tbl)
+                WHERE DATE(usage_start_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
                   AND cost > 0
-                ORDER BY project.id
+                GROUP BY project.id, date ORDER BY project.id, date
                 """
             let grp = DispatchGroup()
             var r1: [[String]]?, r2: [[String]]?, r3: [[String]]?
@@ -388,11 +392,7 @@ class DataMgr {
             grp.enter()
             BQ.query(q2, project: cfg.projectId, token: token) { rows in r2 = rows; grp.leave() }
             grp.enter()
-            if self?.allProjects.isEmpty == true {
-                BQ.query(q3, project: cfg.projectId, token: token) { rows in r3 = rows; grp.leave() }
-            } else {
-                r3 = []; grp.leave()
-            }
+            BQ.query(q3, project: cfg.projectId, token: token) { rows in r3 = rows; grp.leave() }
 
             grp.notify(queue: .main) { [weak self] in
                 guard let self = self else { return }
@@ -402,11 +402,9 @@ class DataMgr {
                 self.error = nil
                 self.parseDailyData(rows1)
                 self.parseMonthly(rows2)
-                if let r3 = r3, !r3.isEmpty {
-                    self.allProjects = r3.compactMap { $0.first }.filter { !$0.isEmpty }
-                }
+                self.parseProjectCosts(r3 ?? [])
                 self.recomputeTopServices()
-                self.skuCache = [:]  // clear SKU cache on project change
+                self.skuCache = [:]
                 self.lastUpdate = Date()
                 done(true)
             }
@@ -437,6 +435,23 @@ class DataMgr {
         let curM = fmt.string(from: Date())
         curMonth = months.first(where: { $0.month == curM })
         prevMonth = months.first(where: { $0.month != curM })
+    }
+
+    private func parseProjectCosts(_ rows: [[String]]) {
+        // rows: [project.id, date, subtotal]
+        let yStr = DataMgr.yesterdayString()
+        var perProject: [String: [String: Double]] = [:]  // [project: [date: cost]]
+        for r in rows where r.count >= 3 {
+            let proj = r[0]; let date = r[1]; let cost = Double(r[2]) ?? 0
+            perProject[proj, default: [:]][date] = cost
+        }
+        allProjects = perProject.keys.sorted()
+        projectCosts = [:]
+        for (proj, dateCosts) in perProject {
+            let yesterday = dateCosts[yStr] ?? 0
+            let rolling7d = dateCosts.values.reduce(0, +)
+            projectCosts[proj] = (yesterday: yesterday, rolling7d: rolling7d)
+        }
     }
 }
 
@@ -766,6 +781,7 @@ class MainVC: NSViewController, ChartDelegate {
     var onQuit: (() -> Void)?
     var onConsole: (() -> Void)?
     var onConfigChanged: ((Cfg) -> Void)?
+    var onExecReport: (() -> Void)?
 
     init(data: DataMgr, cfg: Cfg) {
         self.data = data; self.cfg = cfg; super.init(nibName: nil, bundle: nil)
@@ -855,6 +871,11 @@ class MainVC: NSViewController, ChartDelegate {
         let consBtn = makeBtn("Console", #selector(consoleTap))
         consBtn.frame.origin = NSPoint(x: gearBtn.frame.minX - consBtn.frame.width - 6, y: 8)
         footerView.addSubview(consBtn)
+
+        let execBtn = makeBtn("Exec Report", #selector(execReportTap))
+        execBtn.contentTintColor = .systemPurple
+        execBtn.frame.origin = NSPoint(x: consBtn.frame.minX - execBtn.frame.width - 6, y: 8)
+        footerView.addSubview(execBtn)
     }
 
     private func makeBtn(_ title: String, _ action: Selector) -> NSButton {
@@ -868,31 +889,69 @@ class MainVC: NSViewController, ChartDelegate {
     @objc private func quitTap() { onQuit?() }
     @objc private func consoleTap() { onConsole?() }
     @objc private func settingsTap() { showSettings() }
+    @objc private func execReportTap() { onExecReport?() }
 
     @objc private func projectChanged() {
         let idx = projectPopup.indexOfSelectedItem
-        if idx == 0 {
+        if idx <= 0 {
             data.selectedProject = nil
         } else {
-            data.selectedProject = projectPopup.titleOfSelectedItem
+            // item.title holds the raw project ID
+            data.selectedProject = projectPopup.selectedItem?.title
         }
         expandedService = nil
         onRefresh?()
     }
 
     private func updateProjectDropdown() {
-        let current = projectPopup.titleOfSelectedItem
+        let prevSel = data.selectedProject
         projectPopup.removeAllItems()
-        projectPopup.addItem(withTitle: "All Projects")
-        for p in data.allProjects {
-            projectPopup.addItem(withTitle: p)
+
+        let mono = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        let dimAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        let costAttrs: [NSAttributedString.Key: Any] = [.font: mono]
+
+        func makeItem(_ name: String, yesterday: Double, rolling7d: Double) -> NSMenuItem {
+            let item = NSMenuItem()
+            let s = NSMutableAttributedString()
+            s.append(NSAttributedString(string: name + "  ", attributes: [.font: NSFont.systemFont(ofSize: 11)]))
+            s.append(NSAttributedString(string: "yday ", attributes: dimAttrs))
+            s.append(NSAttributedString(string: fmtD(yesterday), attributes: costAttrs))
+            s.append(NSAttributedString(string: "  7d ", attributes: dimAttrs))
+            s.append(NSAttributedString(string: fmtD(rolling7d, cents: false), attributes: costAttrs))
+            item.attributedTitle = s
+            item.title = name  // used for identification
+            return item
         }
+
+        // "All Projects"
+        let allItem = makeItem("All Projects", yesterday: data.yesterdaySpend, rolling7d: data.rolling7d)
+        projectPopup.menu?.addItem(allItem)
+
+        // Separator
+        projectPopup.menu?.addItem(NSMenuItem.separator())
+
+        // Per-project, sorted by 7d cost descending
+        let sorted = data.allProjects.sorted {
+            (data.projectCosts[$0]?.rolling7d ?? 0) > (data.projectCosts[$1]?.rolling7d ?? 0)
+        }
+        for p in sorted {
+            let costs = data.projectCosts[p]
+            let item = makeItem(p, yesterday: costs?.yesterday ?? 0, rolling7d: costs?.rolling7d ?? 0)
+            projectPopup.menu?.addItem(item)
+        }
+
         // Restore selection
-        if let sel = data.selectedProject, let idx = projectPopup.itemTitles.firstIndex(of: sel) {
-            projectPopup.selectItem(at: idx)
-        } else if current != nil, let idx = projectPopup.itemTitles.firstIndex(of: current!) {
-            projectPopup.selectItem(at: idx)
+        if let sel = prevSel {
+            for i in 0..<projectPopup.numberOfItems {
+                if projectPopup.item(at: i)?.title == sel {
+                    projectPopup.selectItem(at: i); return
+                }
+            }
         }
+        projectPopup.selectItem(at: 0)
     }
 
     // MARK: Update
@@ -1625,6 +1684,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         mainVC.onRefresh = { [weak self] in self?.fetchData() }
         mainVC.onQuit = { NSApp.terminate(nil) }
         mainVC.onConsole = { [weak self] in self?.openConsole() }
+        mainVC.onExecReport = { [weak self] in self?.runExecReport() }
         mainVC.onConfigChanged = { [weak self] newCfg in
             self?.cfg = newCfg
             self?.data.budget = newCfg.monthlyBudget
@@ -1649,9 +1709,39 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func setupTimer() {
         timer?.invalidate()
+        if cfg.refreshMin < 0 {
+            // Manual only — no timer
+            return
+        }
+        if cfg.refreshMin == 0 {
+            // Smart 2x daily: 7:00 AM and 1:00 PM
+            scheduleNextSmartRefresh()
+            return
+        }
+        // Fixed interval (hourly etc.)
         let interval = TimeInterval(cfg.refreshMin * 60)
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.fetchData()
+        }
+    }
+
+    private func scheduleNextSmartRefresh() {
+        timer?.invalidate()
+        let cal = Calendar.current
+        let now = Date()
+        let today7am = cal.date(bySettingHour: 7, minute: 0, second: 0, of: now)!
+        let today1pm = cal.date(bySettingHour: 13, minute: 0, second: 0, of: now)!
+        let tomorrow7am = cal.date(byAdding: .day, value: 1, to: today7am)!
+
+        let next: Date
+        if now < today7am { next = today7am }
+        else if now < today1pm { next = today1pm }
+        else { next = tomorrow7am }
+
+        let delay = next.timeIntervalSince(now)
+        timer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            self?.fetchData()
+            self?.scheduleNextSmartRefresh()
         }
     }
 
@@ -1724,6 +1814,48 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func openConsole() {
         let url = "https://console.cloud.google.com/billing?project=\(cfg.projectId)"
         NSWorkspace.shared.open(URL(string: url)!)
+    }
+
+    private func runExecReport() {
+        // Find the exec-report.sh script (next to the app bundle or in known location)
+        let scriptPaths = [
+            Bundle.main.bundlePath.replacingOccurrences(of: "CloudMeter.app/Contents/MacOS/CloudMeter", with: "") + "exec-report.sh",
+            Bundle.main.bundlePath.replacingOccurrences(of: "CloudMeter.app", with: "exec-report.sh"),
+            NSHomeDirectory() + "/Development/cloudmeter/exec-report.sh"
+        ]
+        guard let script = scriptPaths.first(where: { FileManager.default.fileExists(atPath: $0) }) else {
+            print("[ExecReport] exec-report.sh not found")
+            return
+        }
+
+        // Show generating indicator
+        if let btn = statusItem.button {
+            btn.title = " Generating report..."
+        }
+
+        // Run in background
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+            proc.arguments = [script]
+            proc.environment = ProcessInfo.processInfo.environment
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = pipe
+
+            do {
+                try proc.run()
+                proc.waitUntilExit()
+                let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                print("[ExecReport] \(output)")
+            } catch {
+                print("[ExecReport] Failed: \(error)")
+            }
+
+            DispatchQueue.main.async {
+                self?.updateMenuBar()
+            }
+        }
     }
 
     private func checkAlerts() {
