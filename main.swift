@@ -11,6 +11,7 @@ import UserNotifications
 let POP_W:       CGFloat = 520
 let POP_MAX_H:   CGFloat = 700
 let HDR_H:       CGFloat = 92
+let FILTER_H:    CGFloat = 28
 let CHART_H:     CGFloat = 194
 let ROW_H:       CGFloat = 40
 let FTR_H:       CGFloat = 40
@@ -199,6 +200,8 @@ class DataMgr {
     var lastUpdate: Date?
     var error: String?
     var budget: Double = 0
+    var allProjects: [String] = []       // distinct project IDs
+    var selectedProject: String? = nil   // nil = all projects
 
     // Cached after each refresh — avoids recomputing per-row
     private var _topServices: [(name: String, total: Double)] = []
@@ -226,6 +229,7 @@ class DataMgr {
 
     var dayOfMonth: Int { Calendar.current.component(.day, from: Date()) }
     var daysInMonth: Int { Calendar.current.range(of: .day, in: .month, for: Date())?.count ?? 30 }
+    var rolling7d: Double { displayDays.reduce(0) { $0 + $1.total } }
     var burnRate: Double { dayOfMonth > 0 ? mtd / Double(dayOfMonth) : 0 }
     var forecast: Double { dayOfMonth > 0 ? mtd / Double(dayOfMonth) * Double(daysInMonth) : 0 }
     var discountAmt: Double { abs(mtdCredits) }
@@ -277,9 +281,10 @@ class DataMgr {
 
     func fetchSKUs(service: String, forDate: String?, cfg: Cfg,
                    done: @escaping ([(sku: String, cost: Double, credits: Double)]?) -> Void) {
-        let cacheKey = "\(service)|\(forDate ?? "7d")"
+        let cacheKey = "\(service)|\(forDate ?? "7d")|\(selectedProject ?? "all")"
         if let cached = skuCache[cacheKey] { done(cached); return }
 
+        let projFilter = selectedProject
         Auth.shared.getToken { token in
             guard let token = token else { done(nil); return }
             let tbl = "`\(cfg.projectId).\(cfg.datasetId).\(cfg.tableId)`"
@@ -289,13 +294,17 @@ class DataMgr {
             } else {
                 dateFilter = "AND DATE(usage_start_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)"
             }
+            let projF: String
+            if let p = projFilter {
+                projF = "AND project.id = '\(p.replacingOccurrences(of: "'", with: "\\'"))'"
+            } else { projF = "" }
             let q = """
                 SELECT sku.description AS sku,
                   ROUND(SUM(cost),4) AS cost,
                   ROUND(SUM(IFNULL((SELECT SUM(c.amount) FROM UNNEST(credits) c),0)),4) AS credits
                 FROM \(tbl)
                 WHERE service.description = '\(service.replacingOccurrences(of: "'", with: "\\'"))'
-                  \(dateFilter)
+                  \(dateFilter) \(projF)
                 GROUP BY sku ORDER BY cost DESC
                 """
             BQ.query(q, project: cfg.projectId, token: token) { [weak self] rows in
@@ -340,12 +349,19 @@ class DataMgr {
                 self?.error = "Auth failed"; done(false); return
             }
             let tbl = "`\(cfg.projectId).\(cfg.datasetId).\(cfg.tableId)`"
+            let projFilter: String
+            if let p = self?.selectedProject {
+                projFilter = "AND project.id = '\(p.replacingOccurrences(of: "'", with: "\\'"))'"
+            } else {
+                projFilter = ""
+            }
             let q1 = """
                 SELECT service.description AS service, DATE(usage_start_time) AS date,
                   ROUND(SUM(cost),4) AS cost,
                   ROUND(SUM(IFNULL((SELECT SUM(c.amount) FROM UNNEST(credits) c),0)),4) AS credits
                 FROM \(tbl)
                 WHERE DATE(usage_start_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
+                  \(projFilter)
                 GROUP BY service, date ORDER BY date, cost DESC
                 """
             let q2 = """
@@ -354,15 +370,29 @@ class DataMgr {
                   ROUND(SUM(IFNULL((SELECT SUM(c.amount) FROM UNNEST(credits) c),0)),2) AS credits
                 FROM \(tbl)
                 WHERE DATE(usage_start_time) >= DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL 1 MONTH), MONTH)
+                  \(projFilter)
                 GROUP BY month ORDER BY month
                 """
+            // Fetch distinct projects (only when we don't have them yet)
+            let q3 = """
+                SELECT DISTINCT project.id FROM \(tbl)
+                WHERE DATE(usage_start_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
+                  AND cost > 0
+                ORDER BY project.id
+                """
             let grp = DispatchGroup()
-            var r1: [[String]]?, r2: [[String]]?
+            var r1: [[String]]?, r2: [[String]]?, r3: [[String]]?
 
             grp.enter()
             BQ.query(q1, project: cfg.projectId, token: token) { rows in r1 = rows; grp.leave() }
             grp.enter()
             BQ.query(q2, project: cfg.projectId, token: token) { rows in r2 = rows; grp.leave() }
+            grp.enter()
+            if self?.allProjects.isEmpty == true {
+                BQ.query(q3, project: cfg.projectId, token: token) { rows in r3 = rows; grp.leave() }
+            } else {
+                r3 = []; grp.leave()
+            }
 
             grp.notify(queue: .main) { [weak self] in
                 guard let self = self else { return }
@@ -372,7 +402,11 @@ class DataMgr {
                 self.error = nil
                 self.parseDailyData(rows1)
                 self.parseMonthly(rows2)
+                if let r3 = r3, !r3.isEmpty {
+                    self.allProjects = r3.compactMap { $0.first }.filter { !$0.isEmpty }
+                }
                 self.recomputeTopServices()
+                self.skuCache = [:]  // clear SKU cache on project change
                 self.lastUpdate = Date()
                 done(true)
             }
@@ -707,6 +741,8 @@ class MainVC: NSViewController, ChartDelegate {
     var mode: ViewMode = .overview
 
     private var headerView: NSView!
+    private var filterView: NSView!
+    private var projectPopup: NSPopUpButton!
     private var chartView: ChartView!
     private var scrollView: NSScrollView!
     private var docView: FlippedView!
@@ -747,13 +783,30 @@ class MainVC: NSViewController, ChartDelegate {
         headerView.wantsLayer = true
         view.addSubview(headerView)
 
+        // Project filter bar
+        filterView = NSView(frame: NSRect(x: 0, y: HDR_H, width: POP_W, height: FILTER_H))
+        filterView.wantsLayer = true
+        let filterLbl = NSTextField(labelWithString: "Project")
+        filterLbl.font = .systemFont(ofSize: 10); filterLbl.textColor = .secondaryLabelColor
+        filterLbl.frame = NSRect(x: PAD, y: 4, width: 50, height: 16)
+        filterView.addSubview(filterLbl)
+        projectPopup = NSPopUpButton(frame: NSRect(x: PAD + 52, y: 2, width: POP_W - PAD * 2 - 52, height: 22))
+        projectPopup.font = .systemFont(ofSize: 11)
+        projectPopup.addItem(withTitle: "All Projects")
+        projectPopup.target = self; projectPopup.action = #selector(projectChanged)
+        filterView.addSubview(projectPopup)
+        let fSep = NSView(frame: NSRect(x: 0, y: FILTER_H - 0.5, width: POP_W, height: 0.5))
+        fSep.wantsLayer = true; fSep.layer?.backgroundColor = NSColor.separatorColor.cgColor
+        filterView.addSubview(fSep)
+        view.addSubview(filterView)
+
         // Chart
-        chartView = ChartView(frame: NSRect(x: 0, y: HDR_H, width: POP_W, height: CHART_H))
+        chartView = ChartView(frame: NSRect(x: 0, y: HDR_H + FILTER_H, width: POP_W, height: CHART_H))
         chartView.delegate = self
         view.addSubview(chartView)
 
         // Scroll
-        let scrollY = HDR_H + CHART_H
+        let scrollY = HDR_H + FILTER_H + CHART_H
         let scrollH: CGFloat = 200
         scrollView = NSScrollView(frame: NSRect(x: 0, y: scrollY, width: POP_W, height: scrollH))
         scrollView.hasVerticalScroller = true
@@ -816,6 +869,32 @@ class MainVC: NSViewController, ChartDelegate {
     @objc private func consoleTap() { onConsole?() }
     @objc private func settingsTap() { showSettings() }
 
+    @objc private func projectChanged() {
+        let idx = projectPopup.indexOfSelectedItem
+        if idx == 0 {
+            data.selectedProject = nil
+        } else {
+            data.selectedProject = projectPopup.titleOfSelectedItem
+        }
+        expandedService = nil
+        onRefresh?()
+    }
+
+    private func updateProjectDropdown() {
+        let current = projectPopup.titleOfSelectedItem
+        projectPopup.removeAllItems()
+        projectPopup.addItem(withTitle: "All Projects")
+        for p in data.allProjects {
+            projectPopup.addItem(withTitle: p)
+        }
+        // Restore selection
+        if let sel = data.selectedProject, let idx = projectPopup.itemTitles.firstIndex(of: sel) {
+            projectPopup.selectItem(at: idx)
+        } else if current != nil, let idx = projectPopup.itemTitles.firstIndex(of: current!) {
+            projectPopup.selectItem(at: idx)
+        }
+    }
+
     // MARK: Update
 
     func update() {
@@ -866,6 +945,8 @@ class MainVC: NSViewController, ChartDelegate {
 
     private func updateOverview() {
         drawHeader()
+        updateProjectDropdown()
+        filterView.isHidden = false
         chartView.days = data.displayDays
         chartView.top5 = data.top5Names
         chartView.colorFor = { [weak self] name in self?.data.colorFor(name) ?? .systemGray }
@@ -891,20 +972,26 @@ class MainVC: NSViewController, ChartDelegate {
         mtdVal.frame = NSRect(x: PAD, y: 22, width: 160, height: 26)
         headerView.addSubview(mtdVal)
 
-        // Billing day
-        let dayInfo = "Day \(data.dayOfMonth) of \(data.daysInMonth)"
-        let dayLbl = NSTextField(labelWithString: dayInfo)
-        dayLbl.font = .systemFont(ofSize: 10); dayLbl.textColor = .secondaryLabelColor
-        dayLbl.alignment = .center
-        dayLbl.frame = NSRect(x: w / 2 - 50, y: 8, width: 100, height: 14)
-        headerView.addSubview(dayLbl)
+        // Rolling 7-day total (center column)
+        let r7Label = NSTextField(labelWithString: "Last 7 Days")
+        r7Label.font = .systemFont(ofSize: 10); r7Label.textColor = .secondaryLabelColor
+        r7Label.alignment = .center
+        r7Label.frame = NSRect(x: w / 2 - 60, y: 8, width: 120, height: 14)
+        headerView.addSubview(r7Label)
 
-        // Burn rate
-        let burnLbl = NSTextField(labelWithString: "\(fmtD(data.burnRate))/day")
-        burnLbl.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
-        burnLbl.alignment = .center
-        burnLbl.frame = NSRect(x: w / 2 - 60, y: 26, width: 120, height: 18)
-        headerView.addSubview(burnLbl)
+        let r7Val = NSTextField(labelWithString: fmtD(data.rolling7d))
+        r7Val.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+        r7Val.alignment = .center
+        r7Val.frame = NSRect(x: w / 2 - 60, y: 22, width: 120, height: 18)
+        headerView.addSubview(r7Val)
+
+        // Billing day + burn rate
+        let dayBurn = "Day \(data.dayOfMonth)/\(data.daysInMonth)  \u{00B7}  \(fmtD(data.burnRate))/day"
+        let dayBurnLbl = NSTextField(labelWithString: dayBurn)
+        dayBurnLbl.font = .systemFont(ofSize: 9); dayBurnLbl.textColor = .tertiaryLabelColor
+        dayBurnLbl.alignment = .center
+        dayBurnLbl.frame = NSRect(x: w / 2 - 80, y: 38, width: 160, height: 12)
+        headerView.addSubview(dayBurnLbl)
 
         // Budget label
         if data.budget > 0 {
@@ -1196,6 +1283,7 @@ class MainVC: NSViewController, ChartDelegate {
 
     private func updateDayDetail(_ date: String) {
         chartView.isHidden = true
+        filterView.isHidden = true
         settingsContainer?.isHidden = true
         drawDayHeader(date)
         rebuildServiceRows(date)
@@ -1278,6 +1366,7 @@ class MainVC: NSViewController, ChartDelegate {
     private func showSettings() {
         mode = .settings
         chartView.isHidden = true
+        filterView.isHidden = true
         headerView.subviews.forEach { $0.removeFromSuperview() }
 
         // Settings header
@@ -1449,20 +1538,21 @@ class MainVC: NSViewController, ChartDelegate {
     // MARK: Layout
 
     private func layoutFrames() {
+        let filterH_actual: CGFloat = filterView.isHidden ? 0 : FILTER_H
         let chartH_actual: CGFloat = chartView.isHidden ? 0 : CHART_H
-        let scrollY = HDR_H + chartH_actual
+        let scrollY = HDR_H + filterH_actual + chartH_actual
         let docH = docView.frame.height
-        let maxScrollH = POP_MAX_H - HDR_H - chartH_actual - FTR_H
+        let maxScrollH = POP_MAX_H - HDR_H - filterH_actual - chartH_actual - FTR_H
         let scrollH = min(max(docH, ROW_H * 3), maxScrollH)
-        let totalH = HDR_H + chartH_actual + scrollH + FTR_H
+        let totalH = HDR_H + filterH_actual + chartH_actual + scrollH + FTR_H
 
         headerView.frame = NSRect(x: 0, y: 0, width: POP_W, height: HDR_H)
-        chartView.frame = NSRect(x: 0, y: HDR_H, width: POP_W, height: CHART_H)
+        filterView.frame = NSRect(x: 0, y: HDR_H, width: POP_W, height: FILTER_H)
+        chartView.frame = NSRect(x: 0, y: HDR_H + filterH_actual, width: POP_W, height: CHART_H)
         scrollView.frame = NSRect(x: 0, y: scrollY, width: POP_W, height: scrollH)
         footerView.frame = NSRect(x: 0, y: scrollY + scrollH, width: POP_W, height: FTR_H)
         view.frame.size = NSSize(width: POP_W, height: totalH)
 
-        // Notify popover to resize
         preferredContentSize = NSSize(width: POP_W, height: totalH)
     }
 }
