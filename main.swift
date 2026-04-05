@@ -102,24 +102,36 @@ class Auth {
     private var expiry: Date?
     private let adcPath = NSHomeDirectory() + "/.config/gcloud/application_default_credentials.json"
     private let queue = DispatchQueue(label: "auth.token")
+    private let gcloudPaths = [
+        "/opt/homebrew/bin/gcloud",
+        "/usr/local/bin/gcloud",
+        "/usr/bin/gcloud"
+    ]
 
     func getToken(_ done: @escaping (String?) -> Void) {
         queue.async { [self] in
             if let t = token, let e = expiry, Date() < e.addingTimeInterval(-60) {
                 done(t); return
             }
-            refresh(done)
+            refreshADC { [self] tok in
+                if let tok = tok {
+                    done(tok)
+                } else {
+                    // Fallback: use gcloud CLI (longer-lived session)
+                    print("[Auth] ADC failed, falling back to gcloud CLI")
+                    refreshGcloud(done)
+                }
+            }
         }
     }
 
-    private func refresh(_ done: @escaping (String?) -> Void) {
-        // called inside queue.async already
+    // Primary: try ADC refresh token
+    private func refreshADC(_ done: @escaping (String?) -> Void) {
         guard let data = FileManager.default.contents(atPath: adcPath),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let cid = json["client_id"] as? String,
               let csec = json["client_secret"] as? String,
               let rtok = json["refresh_token"] as? String else {
-            print("[Auth] Cannot read ADC at \(adcPath)")
             done(nil); return
         }
         var req = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
@@ -138,7 +150,6 @@ class Auth {
                       let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
                       let tok = j["access_token"] as? String,
                       let exp = j["expires_in"] as? Int else {
-                    print("[Auth] Token refresh failed: \(err?.localizedDescription ?? "parse error")")
                     done(nil); return
                 }
                 self?.token = tok
@@ -146,6 +157,36 @@ class Auth {
                 done(tok)
             }
         }.resume()
+    }
+
+    // Fallback: shell out to gcloud CLI for access token
+    private func refreshGcloud(_ done: @escaping (String?) -> Void) {
+        guard let gcloud = gcloudPaths.first(where: { FileManager.default.fileExists(atPath: $0) }) else {
+            print("[Auth] gcloud not found"); done(nil); return
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: gcloud)
+        proc.arguments = ["auth", "print-access-token"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let tok = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let tok = tok, tok.hasPrefix("ya29."), proc.terminationStatus == 0 {
+                self.token = tok
+                self.expiry = Date().addingTimeInterval(3500)  // ~1hr, gcloud tokens last 1hr
+                done(tok)
+            } else {
+                print("[Auth] gcloud returned invalid token")
+                done(nil)
+            }
+        } catch {
+            print("[Auth] gcloud failed: \(error)")
+            done(nil)
+        }
     }
 
     private func urlEncode(_ s: String) -> String {
