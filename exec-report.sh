@@ -148,21 +148,29 @@ Table with metrics:
 For each of the top 5 services by 7-day spend:
 - What it is and what it likely powers in the platform
 - 7-day spend and daily average
-- Notable SKUs driving the cost
+- **SKU deep-dive**: List every SKU over \$1 for that service with its 7-day cost and active_days count. Analyse the SKU mix — e.g. for Vertex AI, which models are being used (Gemini 3.0 Pro vs 2.5 Flash vs embeddings), what does the input/output token ratio suggest about usage patterns, is caching being used effectively?
 - Whether the spend pattern looks normal, concerning, or optimizable
-- Specific technical recommendation if any
+- Specific technical recommendation at the SKU level (e.g. "Switch from Gemini 3.0 Pro to 3 Flash for non-critical workloads — estimated 60% cost reduction on \$110/week input costs")
 
-### 5. Project Breakdown
+### 5. SKU Insights (Cross-Service)
+Analyse the full SKU dataset for patterns the per-service view might miss:
+- Top 10 SKUs by cost (table with service, SKU name, 7d cost, active days)
+- SKUs that only appeared on some days (intermittent/batch workloads) — are these efficient or wasteful?
+- SKUs with caching variants — is caching being utilised? What's the cost of cached vs non-cached?
+- Model version analysis — any legacy/expensive model versions that could be upgraded?
+- Infrastructure SKUs (VPN tunnels, load balancers, NAT) — are these right-sized for actual traffic?
+
+### 6. Project Breakdown
 Table of all projects with: 7-day total, daily average, % of total, assessment (healthy/watch/action)
 
-### 6. Cost Optimization Opportunities
-For each opportunity: what to do, estimated monthly savings, effort (low/med/high), risk (low/med/high).
-Look for: idle resources, over-provisioned services, missing CUDs, dev/staging waste, cheaper SKU alternatives.
+### 7. Cost Optimization Opportunities
+For each opportunity: what to do, estimated monthly savings (calculated from actual SKU costs in the data), effort (low/med/high), risk (low/med/high).
+Look for: idle resources, over-provisioned services, missing CUDs, dev/staging waste, cheaper SKU alternatives, model downgrades, caching opportunities, min-instance over-provisioning.
 
-### 7. Alerts & Risks
-Flag: >30% week-over-week increases, single-day spikes >2x average, underutilized credits.
+### 8. Alerts & Risks
+Flag: >30% week-over-week increases, single-day spikes >2x average, underutilized credits, SKUs appearing unexpectedly.
 
-### 8. Recommendations
+### 9. Recommendations
 Priority table: P1/P2/P3 with Action, Impact, Effort, Timeline columns.
 
 ## Rules
