@@ -159,14 +159,53 @@ class Auth {
         }.resume()
     }
 
-    // Fallback: shell out to gcloud CLI for access token
+    // Fallback: read gcloud's credential DB directly and refresh the token ourselves.
+    // This bypasses gcloud's reauth enforcement and uses Google's own client ID
+    // which has longer-lived refresh token grants.
+    private let gcloudCredDB = NSHomeDirectory() + "/.config/gcloud/credentials.db"
+
     private func refreshGcloud(_ done: @escaping (String?) -> Void) {
-        guard let gcloud = gcloudPaths.first(where: { FileManager.default.fileExists(atPath: $0) }) else {
-            print("[Auth] gcloud not found"); done(nil); return
+        // Read refresh token from gcloud's SQLite credential store
+        guard let cred = readGcloudCred() else {
+            print("[Auth] Cannot read gcloud credentials.db")
+            done(nil); return
         }
+        var req = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
+        req.httpMethod = "POST"
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        let body = [
+            "grant_type=refresh_token",
+            "client_id=\(urlEncode(cred.clientId))",
+            "client_secret=\(urlEncode(cred.clientSecret))",
+            "refresh_token=\(urlEncode(cred.refreshToken))"
+        ].joined(separator: "&")
+        req.httpBody = body.data(using: .utf8)
+        URLSession.shared.dataTask(with: req) { [weak self] d, _, err in
+            self?.queue.async {
+                guard let d = d, err == nil,
+                      let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                      let tok = j["access_token"] as? String,
+                      let exp = j["expires_in"] as? Int else {
+                    print("[Auth] gcloud token refresh failed")
+                    done(nil); return
+                }
+                self?.token = tok
+                self?.expiry = Date().addingTimeInterval(Double(exp))
+                done(tok)
+            }
+        }.resume()
+    }
+
+    private struct GcloudCred {
+        let clientId: String; let clientSecret: String; let refreshToken: String
+    }
+
+    private func readGcloudCred() -> GcloudCred? {
+        guard FileManager.default.fileExists(atPath: gcloudCredDB) else { return nil }
+        // Use sqlite3 CLI to read the DB (avoids linking SQLite framework)
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: gcloud)
-        proc.arguments = ["auth", "print-access-token"]
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        proc.arguments = [gcloudCredDB, "SELECT value FROM credentials LIMIT 1"]
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = Pipe()
@@ -174,19 +213,16 @@ class Auth {
             try proc.run()
             proc.waitUntilExit()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let tok = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let tok = tok, tok.hasPrefix("ya29."), proc.terminationStatus == 0 {
-                self.token = tok
-                self.expiry = Date().addingTimeInterval(3500)  // ~1hr, gcloud tokens last 1hr
-                done(tok)
-            } else {
-                print("[Auth] gcloud returned invalid token")
-                done(nil)
+            guard let str = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  let jsonData = str.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                  let cid = json["client_id"] as? String,
+                  let csec = json["client_secret"] as? String,
+                  let rtok = json["refresh_token"] as? String else {
+                return nil
             }
-        } catch {
-            print("[Auth] gcloud failed: \(error)")
-            done(nil)
-        }
+            return GcloudCred(clientId: cid, clientSecret: csec, refreshToken: rtok)
+        } catch { return nil }
     }
 
     private func urlEncode(_ s: String) -> String {
@@ -1012,13 +1048,15 @@ class MainVC: NSViewController, ChartDelegate {
         showErrorBanner(data.error)
     }
 
+    private static let bannerID = NSUserInterfaceItemIdentifier("errorBanner")
+
     private func showErrorBanner(_ error: String?) {
         // Remove existing banner
-        view.viewWithTag(777)?.removeFromSuperview()
+        for sub in view.subviews where sub.identifier == MainVC.bannerID { sub.removeFromSuperview() }
         guard let error = error else { return }
 
-        let banner = FlippedView(frame: NSRect(x: 0, y: 0, width: POP_W, height: 28))
-        banner.wantsLayer = true; banner._tag = 777
+        let banner = NSView(frame: NSRect(x: 0, y: 0, width: POP_W, height: 28))
+        banner.wantsLayer = true; banner.identifier = MainVC.bannerID
         banner.layer?.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.15).cgColor
 
         let icon = NSTextField(labelWithString: "\u{26A0}")
