@@ -1264,20 +1264,28 @@ class MainVC: NSViewController, ChartDelegate {
 
             // SKU sub-rows if this service is expanded
             if expandedService == svc.name {
-                let cacheKey = "\(svc.name)|\(forDate ?? "7d")"
+                let cacheKey = "\(svc.name)|\(forDate ?? "7d")|\(data.selectedProject ?? "all")"
                 if let skus = data.skuCache[cacheKey] {
-                    for sku in skus where (sku.cost + sku.credits) > 0.001 {
-                        let skuSub = sku.cost + sku.credits
-                        let skuRow = createSKURow(sku.sku, cost: skuSub, maxCost: sub, y: yPos)
-                        docView.addSubview(skuRow)
+                    let visibleSKUs = skus.filter { $0.cost + $0.credits > 0.001 }
+                    if visibleSKUs.isEmpty {
+                        let noLbl = NSTextField(labelWithString: "No SKU breakdown available")
+                        noLbl.font = .systemFont(ofSize: 10); noLbl.textColor = .tertiaryLabelColor
+                        noLbl.frame = NSRect(x: PAD + DOT_SZ + 16, y: yPos + 6, width: 250, height: 14)
+                        docView.addSubview(noLbl)
                         yPos += 28
+                    } else {
+                        for sku in visibleSKUs {
+                            let skuSub = sku.cost + sku.credits
+                            let skuRow = createSKURow(sku.sku, cost: skuSub, maxCost: sub, y: yPos)
+                            docView.addSubview(skuRow)
+                            yPos += 28
+                        }
                     }
                 } else {
-                    // Loading indicator
                     let loadLbl = NSTextField(labelWithString: "Loading SKUs...")
                     loadLbl.font = .systemFont(ofSize: 10, weight: .medium)
                     loadLbl.textColor = .secondaryLabelColor
-                    loadLbl.frame = NSRect(x: PAD + DOT_SZ + 16, y: yPos + 4, width: 200, height: 16)
+                    loadLbl.frame = NSRect(x: PAD + DOT_SZ + 16, y: yPos + 6, width: 200, height: 14)
                     docView.addSubview(loadLbl)
                     yPos += 28
                 }
@@ -1327,9 +1335,13 @@ class MainVC: NSViewController, ChartDelegate {
             } else {
                 self.expandedService = name
                 // Fetch SKUs if not cached
-                let cacheKey = "\(name)|\(self.currentDateFilter ?? "7d")"
+                let cacheKey = "\(name)|\(self.currentDateFilter ?? "7d")|\(self.data.selectedProject ?? "all")"
                 if self.data.skuCache[cacheKey] == nil {
-                    self.data.fetchSKUs(service: name, forDate: self.currentDateFilter, cfg: self.cfg) { [weak self] _ in
+                    self.data.fetchSKUs(service: name, forDate: self.currentDateFilter, cfg: self.cfg) { [weak self] skus in
+                        // Handle fetch failure — cache empty array so we show "No breakdown" instead of perpetual loading
+                        if skus == nil {
+                            self?.data.skuCache[cacheKey] = []
+                        }
                         self?.rebuildServiceRows(self?.currentDateFilter)
                         self?.layoutFrames()
                     }
