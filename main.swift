@@ -108,6 +108,10 @@ class Auth {
         "/usr/bin/gcloud"
     ]
 
+    func clearCache() {
+        queue.async { [self] in token = nil; expiry = nil }
+    }
+
     func getToken(_ done: @escaping (String?) -> Void) {
         queue.async { [self] in
             if let t = token, let e = expiry, Date() < e.addingTimeInterval(-60) {
@@ -1034,50 +1038,78 @@ class MainVC: NSViewController, ChartDelegate {
     // MARK: Update
 
     func update() {
-        switch mode {
-        case .overview: updateOverview()
-        case .dayDetail(let d): updateDayDetail(d)
-        case .settings: break
+        if data.error != nil {
+            showErrorState(data.error)
+            chartView.isHidden = true
+            filterView.isHidden = true
+            rebuildServiceRows(nil)
+            layoutFrames()
+        } else {
+            switch mode {
+            case .overview: updateOverview()
+            case .dayDetail(let d): updateDayDetail(d)
+            case .settings: break
+            }
         }
         // Update timestamp
         if let lbl = footerView.viewWithTag(999) as? NSTextField {
             lbl.stringValue = "Updated \(relativeTime(data.lastUpdate))"
             lbl.textColor = data.error != nil ? .systemOrange : .secondaryLabelColor
         }
-        // Error banner
-        showErrorBanner(data.error)
     }
 
-    private static let bannerID = NSUserInterfaceItemIdentifier("errorBanner")
+    var onReauth: (() -> Void)?
 
-    private func showErrorBanner(_ error: String?) {
-        // Remove existing banner
-        for sub in view.subviews where sub.identifier == MainVC.bannerID { sub.removeFromSuperview() }
+    private func showErrorState(_ error: String?) {
         guard let error = error else { return }
+        // Replace header content with error UI
+        headerView.subviews.forEach { $0.removeFromSuperview() }
 
-        let banner = NSView(frame: NSRect(x: 0, y: 0, width: POP_W, height: 28))
-        banner.wantsLayer = true; banner.identifier = MainVC.bannerID
-        banner.layer?.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.15).cgColor
+        let isAuthError = error.lowercased().contains("auth")
 
         let icon = NSTextField(labelWithString: "\u{26A0}")
-        icon.font = .systemFont(ofSize: 12)
-        icon.frame = NSRect(x: PAD, y: 4, width: 18, height: 20)
-        banner.addSubview(icon)
+        icon.font = .systemFont(ofSize: 24)
+        icon.frame = NSRect(x: PAD, y: 16, width: 30, height: 30)
+        headerView.addSubview(icon)
 
-        let msg = NSTextField(labelWithString: error)
-        msg.font = .systemFont(ofSize: 11, weight: .medium)
-        msg.textColor = .systemOrange
-        msg.frame = NSRect(x: PAD + 20, y: 6, width: POP_W - 2 * PAD - 80, height: 16)
-        banner.addSubview(msg)
+        let title = NSTextField(labelWithString: isAuthError ? "GCP Session Expired" : "Connection Error")
+        title.font = .systemFont(ofSize: 14, weight: .bold)
+        title.textColor = .systemOrange
+        title.frame = NSRect(x: PAD + 34, y: 16, width: 300, height: 20)
+        headerView.addSubview(title)
 
-        let retry = NSButton(title: "Retry", target: self, action: #selector(refreshTap))
-        retry.bezelStyle = .inline; retry.font = .systemFont(ofSize: 10, weight: .medium)
-        retry.sizeToFit(); retry.frame.size.height = 20
-        retry.frame.origin = NSPoint(x: POP_W - PAD - retry.frame.width, y: 4)
-        banner.addSubview(retry)
+        let msg = NSTextField(labelWithString: isAuthError ?
+            "Your org enforces daily re-auth. Click below to re-authenticate." : error)
+        msg.font = .systemFont(ofSize: 11)
+        msg.textColor = .secondaryLabelColor
+        msg.frame = NSRect(x: PAD + 34, y: 36, width: POP_W - PAD * 2 - 34, height: 16)
+        headerView.addSubview(msg)
 
-        view.addSubview(banner, positioned: .above, relativeTo: nil)
+        if isAuthError {
+            let reauthBtn = NSButton(title: "Re-authenticate GCP", target: self, action: #selector(reauthTap))
+            reauthBtn.bezelStyle = .rounded
+            reauthBtn.font = .systemFont(ofSize: 12, weight: .semibold)
+            reauthBtn.contentTintColor = .systemBlue
+            reauthBtn.sizeToFit()
+            reauthBtn.frame.size.height = 28
+            reauthBtn.frame.origin = NSPoint(x: PAD + 34, y: 58)
+            headerView.addSubview(reauthBtn)
+        }
+
+        let retryBtn = NSButton(title: "Retry", target: self, action: #selector(refreshTap))
+        retryBtn.bezelStyle = .rounded
+        retryBtn.font = .systemFont(ofSize: 12, weight: .medium)
+        retryBtn.sizeToFit()
+        retryBtn.frame.size.height = 28
+        retryBtn.frame.origin = NSPoint(x: isAuthError ? PAD + 200 : PAD + 34, y: 58)
+        headerView.addSubview(retryBtn)
+
+        let sep = NSView(frame: NSRect(x: 0, y: HDR_H - 0.5, width: POP_W, height: 0.5))
+        sep.wantsLayer = true; sep.layer?.backgroundColor = NSColor.separatorColor.cgColor
+        headerView.addSubview(sep)
     }
+
+    @objc private func reauthTap() { onReauth?() }
 
     // MARK: Overview
 
@@ -1776,6 +1808,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         mainVC.onQuit = { NSApp.terminate(nil) }
         mainVC.onConsole = { [weak self] in self?.openConsole() }
         mainVC.onExecReport = { [weak self] in self?.runExecReport() }
+        mainVC.onReauth = { [weak self] in self?.runReauth() }
         mainVC.onConfigChanged = { [weak self] newCfg in
             self?.cfg = newCfg
             self?.data.budget = newCfg.monthlyBudget
@@ -1837,6 +1870,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func fetchData() {
+        Auth.shared.clearCache()  // force fresh token attempt
         data.refresh(cfg) { [weak self] ok in
             guard let self = self else { return }
             DispatchQueue.main.async {
@@ -1900,6 +1934,38 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func closePopover() {
         popover.performClose(nil)
         if let m = eventMonitor { NSEvent.removeMonitor(m); eventMonitor = nil }
+    }
+
+    private func runReauth() {
+        // Open Terminal and run gcloud auth login
+        let script = """
+            tell application "Terminal"
+                activate
+                do script "gcloud auth login && echo '\\n\\n=== Re-auth complete. CloudMeter will refresh automatically. ===\\n'"
+            end tell
+            """
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        proc.arguments = ["-e", script]
+        try? proc.run()
+
+        // Poll for auth to come back (check every 5 seconds for 2 minutes)
+        if let btn = statusItem.button { btn.title = " Waiting for re-auth..." }
+        var attempts = 0
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] timer in
+            attempts += 1
+            if attempts > 24 { timer.invalidate(); self?.updateMenuBar(); return }  // 2 min timeout
+            // Check if auth works now
+            Auth.shared.clearCache()
+            Auth.shared.getToken { token in
+                if token != nil {
+                    timer.invalidate()
+                    DispatchQueue.main.async {
+                        self?.fetchData()
+                    }
+                }
+            }
+        }
     }
 
     private func openConsole() {
