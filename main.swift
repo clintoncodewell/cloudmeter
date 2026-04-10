@@ -1969,8 +1969,58 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func openConsole() {
-        let url = "https://console.cloud.google.com/billing?project=\(cfg.projectId)"
-        NSWorkspace.shared.open(URL(string: url)!)
+        // Extract billing account ID from table name:
+        // gcp_billing_export_v1_018478_B3618A_69FCBB -> 018478-B3618A-69FCBB
+        let billingAcct = cfg.tableId
+            .replacingOccurrences(of: "gcp_billing_export_resource_v1_", with: "")
+            .replacingOccurrences(of: "gcp_billing_export_v1_", with: "")
+            .replacingOccurrences(of: "_", with: "-")
+
+        // Determine date range from current view mode
+        var fromDate: String? = nil
+        var toDate: String? = nil
+        if case .dayDetail(let date) = mainVC.mode {
+            fromDate = date; toDate = date
+        } else {
+            // Overview = last 7 days
+            let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
+            let cal = Calendar.current
+            toDate = fmt.string(from: Date())
+            fromDate = fmt.string(from: cal.date(byAdding: .day, value: -7, to: Date())!)
+        }
+
+        // Build URL — GCP billing reports support semicolon path params for state
+        // and we explicitly group by SKU so the report opens drilled down
+        var url = "https://console.cloud.google.com/billing/\(billingAcct)/reports"
+        url += ";timeRange=customRange"
+        if let f = fromDate { url += ";from=\(f)" }
+        if let t = toDate { url += ";to=\(t)" }
+        url += ";groupByFields=sku"
+        url += "?project=\(cfg.projectId)"
+
+        // If a specific project is selected, add it as a filter
+        if let proj = data.selectedProject, proj != cfg.projectId {
+            url += "&filter=project:\(proj)"
+        }
+
+        guard let u = URL(string: url) else { return }
+        openInChrome(u)
+    }
+
+    private func openInChrome(_ url: URL) {
+        let chromePaths = [
+            "/Applications/Google Chrome.app",
+            "/Applications/Google Chrome Canary.app",
+            NSHomeDirectory() + "/Applications/Google Chrome.app"
+        ]
+        if let chrome = chromePaths.first(where: { FileManager.default.fileExists(atPath: $0) }) {
+            let cfg = NSWorkspace.OpenConfiguration()
+            cfg.activates = true
+            NSWorkspace.shared.open([url], withApplicationAt: URL(fileURLWithPath: chrome),
+                                    configuration: cfg, completionHandler: nil)
+        } else {
+            NSWorkspace.shared.open(url)  // fall back to default
+        }
     }
 
     private func runExecReport() {
